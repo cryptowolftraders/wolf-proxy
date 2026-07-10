@@ -30,6 +30,7 @@ ROUTES = [
     ("/bybit/",     "https://api.bybit.com",        True),
     ("/hl/",        "https://api.hyperliquid.xyz",   True),
     ("/coingecko/", "https://api.coingecko.com",     True),
+    ("/mexc/",      "https://contract.mexc.com",     True),
     ("/fapi",       "https://fapi.binance.com",      False),
     ("/futures",    "https://fapi.binance.com",      False),
     ("/dapi",       "https://dapi.binance.com",      False),
