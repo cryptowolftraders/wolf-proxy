@@ -182,7 +182,7 @@ def cache_put(url, status, content, ctype, ttl):
 WORKERS = int(os.environ.get("WEB_CONCURRENCY", os.environ.get("PROXY_WORKERS", 4)))
 
 _UPSTREAM_LIMITS = {
-    "https://fapi.binance.com": (18, 30),
+    "https://fapi.binance.com": (10, 15),
     "https://dapi.binance.com": (10, 20),
     "https://api.binance.com": (10, 20),
     "https://api.bybit.com": (10, 20),
