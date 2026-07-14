@@ -30,6 +30,13 @@ HIC REST istegi gitmeden cevaplanir. Boylece hem daha hizli hem daha
 guncel veri donulur. Diger tum uc noktalar (ticker, funding, vb.)
 degismedi; cache + rate limiter aynen calismaya devam ediyor.
 
+v5 -- REDIS CACHE:
+Birden fazla worker/instance ayni Redis'e (REDIS_URL) yazip okuyarak
+cache'i paylasiyor; boylece bir worker'in Binance'e gidip cektigi veriyi
+diger worker'lar/instance'lar da aninda, tekrar Binance'e gitmeden
+kullanabiliyor. Redis'e baglanilamazsa otomatik olarak eski bellek ici
+cache'e (worker'a ozel) geri donuluyor, servis kesintiye ugramiyor.
+
 Not: Railway'de gunicorn birden fazla worker (process) ile calisiyor;
 her worker'in kendi bellegi (dolayisiyla kendi token bucket'i ve kendi
 websocket baglantisi) var. Bu yuzden hedeflenen TOPLAM hiz, worker
@@ -52,11 +59,25 @@ from flask import Flask, request, Response
 import requests
 import websocket
 import logging
+import hashlib
+import base64
+import redis
 
 logging.basicConfig(level=logging.INFO, format="[WS %(asctime)s][PID %(process)d] %(message)s")
 log = logging.getLogger("wolf_ws")
 
 app = Flask(__name__)
+
+REDIS_URL = os.environ.get("REDIS_URL")
+_redis = None
+if REDIS_URL:
+    try:
+        _redis = redis.from_url(REDIS_URL, socket_timeout=2, socket_connect_timeout=2)
+        _redis.ping()
+        log.info("Redis'e baglanildi: cache worker'lar/instance'lar arasinda paylasilacak")
+    except Exception as e:
+        log.warning("Redis'e baglanilamadi (%s), bellek ici cache'e devam ediliyor", e)
+        _redis = None
 
 ROUTES = [
     ("/bybit/", "https://api.bybit.com", True),
@@ -105,7 +126,19 @@ def ttl_for(target):
             return sec
     return DEFAULT_TTL
 
+def _cache_key(url):
+    return "wolfproxy:cache:" + hashlib.md5(url.encode()).hexdigest()
+
 def cache_get(url):
+    if _redis:
+        try:
+            raw_val = _redis.get(_cache_key(url))
+            if raw_val:
+                obj = json.loads(raw_val)
+                return obj["status"], base64.b64decode(obj["content"]), obj["ctype"]
+            return None
+        except Exception as e:
+            log.warning("Redis GET hatasi (%s), bellek ici cache'e bakiliyor", e)
     with _lock:
         item = _cache.get(url)
         if item and item[0] > time.time():
@@ -117,6 +150,17 @@ def cache_get(url):
 def cache_put(url, status, content, ctype, ttl):
     if ttl <= 0:
         return
+    if _redis:
+        try:
+            payload = json.dumps({
+                "status": status,
+                "content": base64.b64encode(content).decode(),
+                "ctype": ctype,
+            })
+            _redis.setex(_cache_key(url), ttl, payload)
+            return
+        except Exception as e:
+            log.warning("Redis SET hatasi (%s), bellek ici cache'e yaziliyor", e)
     with _lock:
         if len(_cache) >= MAX_CACHE_ENTRIES:
             for k in list(_cache.keys())[:500]:
