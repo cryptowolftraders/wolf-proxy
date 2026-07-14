@@ -51,6 +51,10 @@ from collections import deque, OrderedDict
 from flask import Flask, request, Response
 import requests
 import websocket
+import logging
+
+logging.basicConfig(level=logging.INFO, format="[WS %(asctime)s][PID %(process)d] %(message)s")
+log = logging.getLogger("wolf_ws")
 
 app = Flask(__name__)
 
@@ -176,10 +180,12 @@ class KlineStreamManager:
     def _run_forever(self):
         while True:
             try:
+                log.info("WS baglantisi kuruluyor: %s", KLINE_WS_URL)
                 self._connect_and_run()
-            except Exception:
-                pass
+            except Exception as e:
+                log.exception("WS run_forever hatasi: %s", e)
             self._connected.clear()
+            log.warning("WS baglantisi koptu/kapandi, 3sn sonra tekrar denenecek")
             time.sleep(3)
 
     def _connect_and_run(self):
@@ -187,13 +193,15 @@ class KlineStreamManager:
             self._connected.set()
             with self._lock:
                 streams = list(self._buffers.keys())
+            log.info("WS ACIK (baglanti kuruldu). Yeniden abone olunacak stream sayisi: %d", len(streams))
             if streams:
                 self._send_sub(ws, streams, "SUBSCRIBE")
 
         def on_message(ws, message):
             try:
                 msg = json.loads(message)
-            except Exception:
+            except Exception as e:
+                log.warning("WS mesaj JSON parse hatasi: %s", e)
                 return
             data = msg.get("data")
             stream = msg.get("stream")
@@ -204,21 +212,27 @@ class KlineStreamManager:
                 k["t"], k["o"], k["h"], k["l"], k["c"], k["v"],
                 k["T"], k["q"], k["n"], k["V"], k["Q"], "0",
             ]
+            first = False
             with self._lock:
                 buf = self._buffers.get(stream)
                 if buf is None:
+                    log.debug("WS veri geldi ama bu worker'da abone degil: %s", stream)
                     return
+                first = len(buf) == 0
                 if buf and buf[-1][0] == row[0]:
                     buf[-1] = row
                 else:
                     buf.append(row)
                 self._last_update[stream] = time.monotonic()
+            if first:
+                log.info("Stream icin ILK canli veri alindi: %s", stream)
 
         def on_error(ws, error):
-            pass
+            log.error("WS hata olustu: %s", error)
 
         def on_close(ws, *a):
             self._connected.clear()
+            log.warning("WS kapandi (on_close): %s", a)
 
         self._ws = websocket.WebSocketApp(
             KLINE_WS_URL,
@@ -251,6 +265,11 @@ class KlineStreamManager:
                 self._send_sub(self._ws, [evicted], "UNSUBSCRIBE")
             if is_new:
                 self._send_sub(self._ws, [stream], "SUBSCRIBE")
+        if is_new:
+            log.info(
+                "[PID %d] Yeni abonelik: %s (WS bagli mi: %s, evicted: %s)",
+                os.getpid(), stream, self._connected.is_set(), evicted,
+            )
         return stream
 
     def seed(self, symbol, interval, rows):
@@ -265,10 +284,16 @@ class KlineStreamManager:
         stream = "%s@kline_%s" % (symbol.lower(), interval)
         with self._lock:
             last = self._last_update.get(stream)
-            if last is None or (time.monotonic() - last) > WS_STALE_AFTER:
+            if last is None:
+                log.debug("[PID %d] get_live MISS (%s): WS'den hic veri gelmedi", os.getpid(), stream)
+                return None
+            age = time.monotonic() - last
+            if age > WS_STALE_AFTER:
+                log.info("[PID %d] get_live MISS (%s): veri bayat (%.1fsn > %ssn)", os.getpid(), stream, age, WS_STALE_AFTER)
                 return None
             buf = self._buffers.get(stream)
             if not buf or len(buf) < min(limit, 2):
+                log.debug("[PID %d] get_live MISS (%s): buffer yetersiz (%d satir)", os.getpid(), stream, len(buf) if buf else 0)
                 return None
             rows = list(buf)[-limit:]
         return rows
@@ -319,6 +344,11 @@ def proxy(path):
             kl_limit = 500
         kline_manager.ensure_subscribed(kl_symbol, kl_interval)
         live_rows = kline_manager.get_live(kl_symbol, kl_interval, kl_limit)
+        log.info(
+            "[PID %d] klines istegi: %s/%s -> %s",
+            os.getpid(), kl_symbol, kl_interval,
+            "WS-LIVE" if live_rows is not None else "REST'e dusuyor",
+        )
         if live_rows is not None:
             out = dict(CORS)
             out["Content-Type"] = "application/json"
