@@ -37,6 +37,18 @@ diger worker'lar/instance'lar da aninda, tekrar Binance'e gitmeden
 kullanabiliyor. Redis'e baglanilamazsa otomatik olarak eski bellek ici
 cache'e (worker'a ozel) geri donuluyor, servis kesintiye ugramiyor.
 
+v6 -- WS ABONELIK HIZ SINIRLAYICI:
+v4'te yeni bir sembol/interval istendiginde SUBSCRIBE mesaji Binance'e
+aninda gonderiliyordu. Site ayni anda cok sayida farkli sembol/interval
+tarattiginda (ob-scanner, fvg, kanal taramalari vb.) bu ani SUBSCRIBE
+patlamasi Binance'i "Too many requests" (policy violation) sebebiyle
+baglantiyi kapatmaya zorluyordu; bu da surekli kopup yeniden baglanma
+ve WS-LIVE verinin REST'e dusmesine yol aciyordu. Artik SUBSCRIBE/
+UNSUBSCRIBE istekleri bir kuyruga alinip WS_SUB_RATE_PER_SEC ile
+sinirlandirilarak gonderiliyor; boylece baglanti stabil kaliyor ve
+canli veri (dolayisiyla sitedeki tarama sonuclari) gercek zamanliya
+daha yakin ve tutarli kaliyor.
+
 Not: Railway'de gunicorn birden fazla worker (process) ile calisiyor;
 her worker'in kendi bellegi (dolayisiyla kendi token bucket'i ve kendi
 websocket baglantisi) var. Bu yuzden hedeflenen TOPLAM hiz, worker
@@ -211,6 +223,7 @@ KLINE_WS_URL = "wss://fstream.binance.com/stream"
 MAX_WS_STREAMS = 60
 KLINE_BUFFER_LEN = 500
 WS_STALE_AFTER = 30
+WS_SUB_RATE_PER_SEC = 4  # Binance'e saniyede en fazla bu kadar SUBSCRIBE/UNSUBSCRIBE mesaji gonderilir
 
 class KlineStreamManager:
     def __init__(self):
@@ -219,7 +232,42 @@ class KlineStreamManager:
         self._last_update = {}
         self._ws = None
         self._connected = threading.Event()
+        self._sub_queue = deque()
+        self._sub_queue_lock = threading.Lock()
+        self._sub_bucket = TokenBucket(WS_SUB_RATE_PER_SEC, WS_SUB_RATE_PER_SEC)
         threading.Thread(target=self._run_forever, daemon=True).start()
+        threading.Thread(target=self._sub_worker, daemon=True).start()
+
+    def _queue_sub(self, stream, method):
+        with self._sub_queue_lock:
+            self._sub_queue.append((stream, method))
+
+    def _sub_worker(self):
+        while True:
+            item = None
+            with self._sub_queue_lock:
+                if self._sub_queue:
+                    item = self._sub_queue.popleft()
+            if item is None:
+                time.sleep(0.1)
+                continue
+            stream, method = item
+            if not (self._connected.is_set() and self._ws):
+                if method == "SUBSCRIBE":
+                    with self._sub_queue_lock:
+                        self._sub_queue.append(item)
+                time.sleep(0.5)
+                continue
+            self._sub_bucket.acquire()
+            if self._connected.is_set() and self._ws:
+                self._send_sub(self._ws, [stream], method)
+                log.info(
+                    "WS %s gonderildi: %s (kuyrukta kalan: %d)",
+                    method, stream, len(self._sub_queue),
+                )
+            elif method == "SUBSCRIBE":
+                with self._sub_queue_lock:
+                    self._sub_queue.append(item)
 
     def _run_forever(self):
         while True:
@@ -238,8 +286,8 @@ class KlineStreamManager:
             with self._lock:
                 streams = list(self._buffers.keys())
             log.info("WS ACIK (baglanti kuruldu). Yeniden abone olunacak stream sayisi: %d", len(streams))
-            if streams:
-                self._send_sub(ws, streams, "SUBSCRIBE")
+            for s in streams:
+                self._queue_sub(s, "SUBSCRIBE")
 
         def on_message(ws, message):
             try:
@@ -304,14 +352,12 @@ class KlineStreamManager:
                     evicted, _ = self._buffers.popitem(last=False)
                     self._last_update.pop(evicted, None)
                 self._buffers[stream] = deque(maxlen=KLINE_BUFFER_LEN)
-        if self._connected.is_set() and self._ws:
-            if evicted:
-                self._send_sub(self._ws, [evicted], "UNSUBSCRIBE")
-            if is_new:
-                self._send_sub(self._ws, [stream], "SUBSCRIBE")
+        if evicted:
+            self._queue_sub(evicted, "UNSUBSCRIBE")
         if is_new:
+            self._queue_sub(stream, "SUBSCRIBE")
             log.info(
-                "[PID %d] Yeni abonelik: %s (WS bagli mi: %s, evicted: %s)",
+                "[PID %d] Yeni abonelik kuyruga alindi: %s (WS bagli mi: %s, evicted: %s)",
                 os.getpid(), stream, self._connected.is_set(), evicted,
             )
         return stream
